@@ -1,3 +1,4 @@
+
 name: Build pinned Prisma Schema Engine
 
 "on":
@@ -207,7 +208,15 @@ jobs:
             printf 'image=%s %s\n' "$ImageOS" "$ImageVersion"
             getconf GNU_LIBC_VERSION
             openssl version
-            dpkg-query -W gcc g++ libc6 libc6-dev libssl-dev binutils cmake pkg-config
+            cmake --version
+            for package in gcc g++ libc6 libc6-dev libssl-dev binutils pkg-config; do
+              if status=$(dpkg-query -W -f='${db:Status-Status}' "$package" 2>/dev/null) &&
+                 [ "$status" = installed ]; then
+                dpkg-query -W -f='${binary:Package}\t${Version}\n' "$package"
+              else
+                printf 'dpkg package not installed: %s\n' "$package"
+              fi
+            done
           } > result/provenance.txt
 
           cd result
