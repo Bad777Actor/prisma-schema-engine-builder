@@ -1,0 +1,224 @@
+name: Build pinned Prisma Schema Engine
+
+"on":
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: prisma-schema-engine
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: >-
+      github.repository == 'Bad777Actor/prisma-schema-engine-builder' &&
+      github.event.repository.private == false &&
+      github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+
+    defaults:
+      run:
+        shell: bash --noprofile --norc -euo pipefail {0}
+
+    env:
+      ENGINE_COMMIT: 0edf323efd1d98336f3f0a68684b56f689b900d3
+      RUST_VERSION: 1.97.1
+      TARGET: x86_64-unknown-linux-gnu
+      CARGO_INCREMENTAL: "0"
+      CARGO_BUILD_JOBS: "2"
+      CARGO_NET_RETRY: "0"
+      CARGO_TERM_COLOR: never
+      LC_ALL: C
+
+    steps:
+      - name: Checkout official engine
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: prisma/prisma-engines
+          ref: 0edf323efd1d98336f3f0a68684b56f689b900d3
+          path: engine
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: false
+          lfs: false
+
+      - name: Verify source and runner
+        run: |
+          test "$(uname -m)" = x86_64
+          . /etc/os-release
+          test "$ID" = ubuntu
+          test "$VERSION_ID" = 24.04
+          test "$(getconf GNU_LIBC_VERSION)" = "glibc 2.39"
+
+          for tool in git rustup cc c++ make cmake clang pkg-config readelf file timeout python3 openssl ldd; do
+            command -v "$tool"
+          done
+          test "$(pkg-config --modversion openssl | cut -d. -f1)" = 3
+          test -x /usr/bin/time
+
+          for path in "$GITHUB_WORKSPACE" "$RUNNER_TEMP" "${CARGO_HOME:-$HOME/.cargo}" "${RUSTUP_HOME:-$HOME/.rustup}"; do
+            test "$(df -Pk "$path" | awk 'NR==2 {print $4}')" -ge 8388608
+          done
+          free -h
+          df -h "$GITHUB_WORKSPACE"
+
+          cd engine
+          test "$(git rev-parse HEAD)" = "$ENGINE_COMMIT"
+          test -z "$(git status --porcelain --untracked-files=all --ignored=matching)"
+          git diff --exit-code "$ENGINE_COMMIT" -- Cargo.lock
+
+          mkdir "$RUNNER_TEMP/prisma-proof"
+          sha256sum Cargo.lock > "$RUNNER_TEMP/prisma-proof/Cargo.lock.sha256"
+          cp Cargo.lock "$RUNNER_TEMP/prisma-proof/Cargo.lock"
+
+          python3 - <<'PY'
+          import os, tomllib
+          with open("rust-toolchain.toml", "rb") as f:
+              assert tomllib.load(f)["toolchain"]["channel"] == os.environ["RUST_VERSION"]
+          PY
+
+      - name: Install pinned official Rust toolchain
+        timeout-minutes: 15
+        run: |
+          unset RUSTUP_DIST_SERVER RUSTUP_UPDATE_ROOT
+          rustup toolchain install "$RUST_VERSION" --profile minimal --target "$TARGET"
+
+          rustc +"$RUST_VERSION" -Vv | tee "$RUNNER_TEMP/prisma-proof/rustc.txt"
+          cargo +"$RUST_VERSION" -Vv | tee "$RUNNER_TEMP/prisma-proof/cargo.txt"
+
+          test "$(rustc +"$RUST_VERSION" --version | awk '{print $2}')" = "$RUST_VERSION"
+          test "$(rustc +"$RUST_VERSION" -Vv | sed -n 's/^host: //p')" = "$TARGET"
+
+      - name: Build only schema-engine
+        timeout-minutes: 150
+        run: |
+          cd engine
+          unset GIT_HASH RUSTFLAGS CARGO_ENCODED_RUSTFLAGS
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/prisma-target"
+
+          for path in "$RUNNER_TEMP" "${CARGO_HOME:-$HOME/.cargo}"; do
+            test "$(df -Pk "$path" | awk 'NR==2 {print $4}')" -ge 6291456
+          done
+
+          python3 - <<'PY'
+          import os, pathlib, shutil, signal, subprocess, sys, time
+
+          env = os.environ
+          paths = [
+              env["RUNNER_TEMP"],
+              env.get("CARGO_HOME", str(pathlib.Path.home() / ".cargo")),
+          ]
+          command = [
+              "/usr/bin/time", "-v", "timeout", "--signal=TERM",
+              "--kill-after=30s", "140m",
+              "cargo", "+" + env["RUST_VERSION"], "build",
+              "--locked", "--release", "--target", env["TARGET"],
+              "--package", "schema-engine-cli", "--bin", "schema-engine",
+              "--jobs", "2",
+          ]
+
+          process = subprocess.Popen(command, start_new_session=True)
+          try:
+              while process.poll() is None:
+                  if any(shutil.disk_usage(p).free < 1024**3 for p in paths):
+                      raise RuntimeError("STOP: less than 1 GiB disk reserve")
+                  time.sleep(5)
+              if process.returncode != 0:
+                  sys.exit(process.returncode if process.returncode > 0 else 1)
+          finally:
+              if process.poll() is None:
+                  os.killpg(process.pid, signal.SIGTERM)
+                  try:
+                      process.wait(timeout=30)
+                  except subprocess.TimeoutExpired:
+                      os.killpg(process.pid, signal.SIGKILL)
+                      process.wait()
+          PY
+
+          sha256sum --check "$RUNNER_TEMP/prisma-proof/Cargo.lock.sha256"
+          test -z "$(git status --porcelain --untracked-files=all --ignored=matching)"
+
+      - name: Validate and package binary
+        run: |
+          binary="$RUNNER_TEMP/prisma-target/$TARGET/release/schema-engine"
+          test -f "$binary"
+          test ! -L "$binary"
+          mkdir "$GITHUB_WORKSPACE/result"
+          export BINARY="$binary"
+
+          python3 - <<'PY'
+          import os, struct, subprocess, re
+
+          with open(os.environ["BINARY"], "rb") as f:
+              header = f.read(64)
+          assert header[:6] == b"\x7fELF\x02\x01"
+          assert struct.unpack_from("<H", header, 18)[0] == 62
+
+          versions = subprocess.check_output(
+              ["readelf", "--version-info", os.environ["BINARY"]], text=True)
+          glibc = [
+              tuple(map(int, x.split(".")))
+              for x in re.findall(r"GLIBC_(\d+(?:\.\d+)+)", versions)
+          ]
+          assert glibc and max(glibc) <= (2, 39)
+
+          dynamic = subprocess.check_output(
+              ["readelf", "-d", os.environ["BINARY"]], text=True)
+          needed = set(re.findall(r"Shared library: \[(.*?)\]", dynamic))
+          assert {"libssl.so.3", "libcrypto.so.3"} <= needed
+          assert all(
+              x in {"libssl.so.3", "libcrypto.so.3"}
+              for x in needed if x.startswith(("libssl.", "libcrypto."))
+          )
+          PY
+
+          file "$binary"
+          readelf -l "$binary" > result/program-headers.txt
+          readelf -d "$binary" > result/dynamic.txt
+          readelf --version-info "$binary" > result/symbol-versions.txt
+
+          ldd "$binary" > result/ldd.txt
+          cat result/ldd.txt
+          if grep -q "not found" result/ldd.txt; then exit 1; fi
+
+          timeout 15s "$binary" --version > result/engine-version.txt
+          cat result/engine-version.txt
+          python3 - <<'PY'
+          import os, pathlib, re
+
+          version = pathlib.Path("result/engine-version.txt").read_text()
+          assert re.findall(r"\b[0-9a-f]{40}\b", version) == [
+              os.environ["ENGINE_COMMIT"]
+          ]
+          PY
+
+          install -m 0755 "$binary" result/schema-engine-debian-openssl-3.0.x
+          cp "$RUNNER_TEMP/prisma-proof/"* result/
+
+          {
+            printf 'source_commit=%s\n' "$ENGINE_COMMIT"
+            printf 'workflow_ref=%s\n' "$GITHUB_WORKFLOW_REF"
+            printf 'workflow_sha=%s\n' "$GITHUB_WORKFLOW_SHA"
+            printf 'run=%s/%s/actions/runs/%s\n' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID"
+            printf 'attempt=%s\n' "$GITHUB_RUN_ATTEMPT"
+            printf 'image=%s %s\n' "$ImageOS" "$ImageVersion"
+            getconf GNU_LIBC_VERSION
+            openssl version
+            dpkg-query -W gcc g++ libc6 libc6-dev libssl-dev binutils cmake pkg-config
+          } > result/provenance.txt
+
+          cd result
+          sha256sum schema-engine-debian-openssl-3.0.x | tee SHA256SUMS
+
+      - name: Upload verified result
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: schema-engine-linux-x64-0edf323-${{ github.run_id }}-${{ github.run_attempt }}
+          path: result/
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 6
+          overwrite: false
